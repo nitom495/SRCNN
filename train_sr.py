@@ -1,173 +1,292 @@
-import PIL
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-from torch import device
-from torch.nn import Conv2d,MaxPool2d,Flatten,Linear
-from torch.optim import lr_scheduler
-from torch.utils.data import Dataset
-from torch.utils.tensorboard import SummaryWriter
-import time
-import random
-import torchvision.transforms.functional as TF
-from torchvision.transforms import RandomCrop
-from PIL import Image
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-from collections.abc import Callable
-from torch.utils.data import Dataset, DataLoader
+
+import torch
+from torch import nn
+from torch.utils.tensorboard import SummaryWriter
+
+from sr.checkpoint import load_checkpoint
+from sr.config import TrainingConfig
+from sr.data import (
+    build_training_dataset,
+    build_validation_dataset,
+)
+from sr.model import FastSRNet
+from sr.trainer import (
+    make_train_loader,
+    make_validation_loader,
+    run_training,
+    seed_everything,
+)
 
 
-
-class PairedSRTransform:
-    def __init__(self,lr_patch_size=128,scale=2):
-        self.lr_patch_size=lr_patch_size
-        self.scale=scale
-    def __call__(self,lr_image,hr_image):
-        scale=self.scale
-
-        top,left,height,width=RandomCrop.get_params(lr_image,output_size=(self.lr_patch_size,self.lr_patch_size))
-        lr_image=TF.crop(lr_image,top,left,height,width)
-        hr_image=TF.crop(hr_image,top*scale,left*scale,height*scale,width*scale)
-
-        lr=TF.to_tensor(lr_image)
-        hr=TF.to_tensor(hr_image)
-
-        #Randomly Process to improve accuracy
-        if random.random() < 0.5:
-            lr = torch.flip(lr, dims=[2])
-            hr = torch.flip(hr, dims=[2])
-
-        if random.random() < 0.5:
-            lr = torch.flip(lr, dims=[1])
-            hr = torch.flip(hr, dims=[1])
-
-        rotations = random.randint(0, 3)
-        lr = torch.rot90(lr, rotations, dims=[1, 2])
-        hr = torch.rot90(hr, rotations, dims=[1, 2])
-
-        return lr,hr
-
-class PairedSRDataset(Dataset):
-    def __init__(self,lr_dir:str,hr_dir:str,scale:int=2,transform:Callable | None=None):
-        self.lr_dir=Path(lr_dir)
-        self.hr_dir=Path(hr_dir)
-
-        self.scale=scale
-        self.transform=transform
-
-        self.lr_paths = sorted(
-            self.lr_dir.glob(f"*x{scale}.png")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train the FP32 DF2K "
+            "bicubic RGB x2 SR model"
         )
-
-        self.samples = []
-
-        for lr_path in self.lr_paths:
-            image_id = lr_path.stem.removesuffix(f"x{scale}")
-            hr_path = self.hr_dir / f"{image_id}.png"
-
-            self.samples.append((lr_path, hr_path))
-
-    def __len__(self) -> int:
-        return len(self.samples)
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        lr_path, hr_path = self.samples[index]
-
-        lr_image = PIL.Image.open(lr_path).convert("RGB")
-        hr_image = PIL.Image.open(hr_path).convert("RGB")
-
-        lr, hr = self.transform(lr_image,hr_image)
-        return lr,hr
-
-class NN(nn.Module):
-    def __init__(self):
-        super(NN,self).__init__()
-        self.model=nn.Sequential(
-            nn.Conv2d(3,16,kernel_size=3,padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16,16,kernel_size=3,padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16,16,kernel_size=3,padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16,8,kernel_size=3,padding=1),
-            nn.ReLU(),
-            nn.Conv2d(8,12,kernel_size=3,padding=1),
-            nn.PixelShuffle(2),
-        )
-    def forward(self,x):
-        return self.model(x)
-
-def main():
-    device=torch.device("cuda:0")
-
-    train_transform = PairedSRTransform(lr_patch_size=128,scale=2)
-
-    train_dataset = PairedSRDataset(
-        lr_dir=(
-            r"E:\ScienceLane\SR\dataset"
-            r"\DIV2K_train_LR_bicubic\X2"
-        ),
-        hr_dir=(
-            r"E:\ScienceLane\SR\dataset"
-            r"\DIV2K_train_HR"
-        ),
-        scale=2,
-        transform=train_transform,
     )
 
-    #lr, hr = train_dataset[0]
-    #print(lr.shape)
-    #print(hr.shape)
-    #print(lr.min(), lr.max())
-    #print(hr.min(), hr.max())
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("dataset"),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/df2k_x2"),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=150_000,
+    )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=1_000,
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=5_000,
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1_337,
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+    )
 
-    train_loader = DataLoader(dataset=train_dataset,batch_size=64,shuffle=True,drop_last=True,num_workers=4)
-    model=NN().to(device)
-    #print("Model Device:", next(model.parameters()).device)
-    # x=torch.rand(1,3,128,128)
-    # y=model(x)
-    # print("输入：", x.shape)
-    # print("输出：", y.shape)
+    return parser
 
-    loss_fn=nn.L1Loss()
 
-    optimizer=torch.optim.Adam(model.parameters(),lr=2e-4,betas=(0.9,0.999))
+def config_from_arguments(
+    arguments: argparse.Namespace,
+) -> TrainingConfig:
+    return TrainingConfig.from_data_root(
+        arguments.data_root,
+        output_dir=arguments.output_dir,
+        batch_size=arguments.batch_size,
+        num_workers=arguments.num_workers,
+        max_steps=arguments.max_steps,
+        eval_interval=arguments.eval_interval,
+        checkpoint_interval=(
+            arguments.checkpoint_interval
+        ),
+        log_interval=arguments.log_interval,
+        seed=arguments.seed,
+    )
 
-    num_epochs=1
 
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer,T_max=num_epochs,eta_min=1e-6)
+@torch.inference_mode()
+def preflight_model(
+    model: nn.Module,
+    lr: torch.Tensor,
+    hr: torch.Tensor,
+    device: torch.device,
+) -> None:
+    lr_batch = lr.unsqueeze(0).to(
+        device=device,
+        dtype=torch.float32,
+    )
+    hr_batch = hr.unsqueeze(0).to(
+        device=device,
+        dtype=torch.float32,
+    )
 
-    print("start training")
+    sr_batch = model(lr_batch)
 
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        model.train()
-        total_loss=0
-        for lr_batch,hr_batch in train_loader:
-            lr_batch=lr_batch.to(device,non_blocking=True)
-            hr_batch=hr_batch.to(device,non_blocking=True)
-            # print("LR device:", lr_batch.device)
-            # print("HR device:：", hr_batch.device)
+    if sr_batch.shape != hr_batch.shape:
+        raise ValueError(
+            f"model output "
+            f"{tuple(sr_batch.shape)} "
+            f"does not match HR "
+            f"{tuple(hr_batch.shape)}"
+        )
 
-            sr_batch=model(lr_batch)
-            #print("SR device:", sr_batch.device)
+    loss = torch.nn.functional.l1_loss(
+        sr_batch,
+        hr_batch,
+    )
 
-            optimizer.zero_grad()
+    if not torch.isfinite(loss):
+        raise FloatingPointError(
+            f"preflight produced non-finite loss: "
+            f"{float(loss)}"
+        )
 
-            loss=loss_fn(sr_batch,hr_batch)
-            total_loss=total_loss+loss.item()
 
-            loss.backward()
+def main() -> None:
+    arguments = build_parser().parse_args()
+    config = config_from_arguments(arguments)
 
-            optimizer.step()
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required for DF2K training "
+            "but is not available"
+        )
 
-        scheduler.step()
-        average_loss=total_loss/len(train_loader)
-        current_lr=scheduler.get_last_lr()[0]
+    device = torch.device("cuda:0")
 
-        print(f"Epoch: {epoch+1}/{num_epochs} " f"Loss: {average_loss:.4f} " f"LR: {current_lr:.4f}")
+    seed_everything(config.seed)
 
-    torch.save(model.state_dict(),"./models/model.pth")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    config.output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    train_dataset = build_training_dataset(
+        config
+    )
+    validation_dataset = (
+        build_validation_dataset(config)
+    )
+
+    device_name = torch.cuda.get_device_name(
+        device
+    )
+
+    config.save_json(
+        config.output_dir / "config.json",
+        metadata={
+            "device": device_name,
+            "train_pairs": len(train_dataset),
+            "validation_pairs": len(
+                validation_dataset
+            ),
+        },
+    )
+
+    print(
+        f"device={device_name} "
+        f"train_pairs={len(train_dataset)} "
+        f"validation_pairs="
+        f"{len(validation_dataset)} "
+        f"batch_size={config.batch_size} "
+        f"workers={config.num_workers}"
+    )
+
+    model = FastSRNet(
+        config.scale
+    ).to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    sample_lr, sample_hr = train_dataset[0]
+
+    preflight_model(
+        model,
+        sample_lr,
+        sample_hr,
+        device,
+    )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.learning_rate,
+        betas=(0.9, 0.999),
+    )
+
+    scheduler = (
+        torch.optim.lr_scheduler
+        .CosineAnnealingLR(
+            optimizer,
+            T_max=config.max_steps,
+            eta_min=(
+                config.minimum_learning_rate
+            ),
+        )
+    )
+
+    start_step = 0
+    best_y_psnr = float("-inf")
+
+    if arguments.resume is not None:
+        state = load_checkpoint(
+            arguments.resume,
+            model,
+            optimizer,
+            scheduler,
+            device,
+        )
+
+        start_step = state.global_step
+        best_y_psnr = state.best_y_psnr
+
+        print(
+            f"resumed={arguments.resume} "
+            f"step={start_step} "
+            f"best_y_psnr="
+            f"{best_y_psnr:.4f}"
+        )
+
+    if start_step >= config.max_steps:
+        raise ValueError(
+            f"checkpoint step {start_step} "
+            f"must be smaller than "
+            f"max_steps {config.max_steps}"
+        )
+
+    train_loader = make_train_loader(
+        train_dataset,
+        config,
+    )
+    validation_loader = (
+        make_validation_loader(
+            validation_dataset,
+            config,
+        )
+    )
+
+    tensorboard_dir = (
+        config.output_dir / "tensorboard"
+    )
+
+    with SummaryWriter(
+        log_dir=str(tensorboard_dir)
+    ) as writer:
+        run_training(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_loader=train_loader,
+            validation_loader=(
+                validation_loader
+            ),
+            device=device,
+            writer=writer,
+            start_step=start_step,
+            best_y_psnr=best_y_psnr,
+        )
 
 
 if __name__ == "__main__":
