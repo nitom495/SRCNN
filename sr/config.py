@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-
+#基本参数config
 @dataclass(frozen=True)
 class TrainingConfig:
     data_root: Path
@@ -37,7 +37,7 @@ class TrainingConfig:
         **overrides: Any,
     ) -> "TrainingConfig":
         data_root = Path(data_root)
-
+        #路径
         config = cls(
             data_root=data_root,
             output_dir=Path(output_dir),

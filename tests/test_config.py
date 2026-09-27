@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sr.config import TrainingConfig
 
+#检查基本配置
 def test_training_config_has_quality_training_defaults(tmp_path: Path):
     config = TrainingConfig.from_data_root(tmp_path / "dataset")
 
@@ -18,6 +19,7 @@ def test_training_config_has_quality_training_defaults(tmp_path: Path):
         == tmp_path / "dataset" / "Flickr2K_train_LR_bicubic" / "X2"
     )
 
+#检查保存路径
 def test_save_json_converts_paths_and_writes_resolved_config(tmp_path: Path):
     config = TrainingConfig.from_data_root(
         tmp_path / "dataset",
