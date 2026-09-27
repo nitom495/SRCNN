@@ -4,3 +4,6 @@ dataset/
 __pycache__/
 *.py[cod]
 .worktrees/
+outputs/
+models/
+.pytest_cache/
