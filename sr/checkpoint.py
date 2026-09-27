@@ -64,7 +64,7 @@ def _restore_rng_state(
         state["python"]
     )
     torch.set_rng_state(
-        state["torch"]
+        state["torch"].cpu()
     )
 
     if (
@@ -72,7 +72,10 @@ def _restore_rng_state(
         and torch.cuda.is_available()
     ):
         torch.cuda.set_rng_state_all(
-            state["cuda"]
+            [
+                cuda_state.cpu()
+                for cuda_state in state["cuda"]
+            ]
         )
 
 

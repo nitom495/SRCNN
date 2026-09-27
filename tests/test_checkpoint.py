@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 from sr.checkpoint import (
@@ -160,4 +161,65 @@ def test_checkpoint_restores_random_number_states(
     assert torch.equal(
         torch.rand(4),
         expected_torch_value,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required",
+)
+def test_checkpoint_loaded_to_cuda_restores_rng_states(
+    tmp_path: Path,
+):
+    random.seed(123)
+    torch.manual_seed(123)
+
+    model, optimizer, scheduler = (
+        make_training_objects()
+    )
+    model = model.cuda()
+
+    path = tmp_path / "cuda_rng_state.pth"
+
+    save_checkpoint(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        global_step=1,
+        best_y_psnr=30.0,
+        config={"scale": 2},
+    )
+
+    expected_python_value = random.random()
+    expected_torch_value = torch.rand(4)
+    expected_cuda_value = torch.rand(
+        4,
+        device="cuda",
+    )
+
+    restored_model, restored_optimizer, restored_scheduler = (
+        make_training_objects()
+    )
+    restored_model = restored_model.cuda()
+
+    random.seed(999)
+    torch.manual_seed(999)
+
+    load_checkpoint(
+        path,
+        restored_model,
+        restored_optimizer,
+        restored_scheduler,
+        torch.device("cuda"),
+    )
+
+    assert random.random() == expected_python_value
+    assert torch.equal(
+        torch.rand(4),
+        expected_torch_value,
+    )
+    assert torch.equal(
+        torch.rand(4, device="cuda"),
+        expected_cuda_value,
     )
